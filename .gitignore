@@ -47,3 +47,4 @@ TODO
 .env.development
 .env.test
 .env.production
+src/main/resources/application.properties
