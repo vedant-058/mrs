@@ -5,10 +5,13 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
@@ -21,6 +24,7 @@ import com.mrs.mrs.DTO.SeatLock.ConfirmBookingRequestDTO;
 import com.mrs.mrs.DTO.SeatLock.ReleaseSeatsRequestDTO;
 import com.mrs.mrs.DTO.SeatLock.SeatLockRequestDTO;
 import com.mrs.mrs.DTO.SeatLock.SeatLockViewDTO;
+import com.mrs.mrs.DTO.SeatLock.SeatUpdateEvent;
 import com.mrs.mrs.exception.InvalidRequestException;
 import com.mrs.mrs.exception.PastShowtimeBookingException;
 import com.mrs.mrs.exception.ResourceAlreadyExistsException;
@@ -48,32 +52,24 @@ public class SeatLockService {
     private ShowtimeRepository showtimeRepository;
     @Autowired
     private UserRepository userRepository;
-    // private static final int LOCK_TIMEOUT_MINUTES = 1;
+    
+    @Autowired
+    private ApplicationEventPublisher eventPublisher;
+    
     @Value("${seat.lock.timeout.seconds}")
     private int LOCK_TIMEOUT_SECONDS;
 
-    /**
-     * Lock seat with optimistic locking (retry mechanism)
-     * HIGH CONCURRENCY: Uses SERIALIZABLE isolation + optimistic locking
-     */
-    @Transactional(isolation = Isolation.READ_COMMITTED) // Changed from SERIALIZABLE for better performance
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public List<SeatLockViewDTO> lockSeats(SeatLockRequestDTO request) {
         try{
             Showtime s = showtimeRepository.findById(request.getShowtimeId())
                 .orElseThrow(() -> new ResourceNotFoundException("Showtime", "id", request.getShowtimeId()));
 
-            // Check if showtime is in the past
-            try {
-                if (s.getShowtime().isBefore(Instant.now())) {
-                    throw new PastShowtimeBookingException("Booking for past showtimes is not allowed"+s.getShowtime());
-                }
-            } catch (PastShowtimeBookingException e) {
+            if (s.getShowtime().isBefore(Instant.now())) {
                 throw new InvalidRequestException("Booking for past showtimes is not allowed"+s.getShowtime());
             }
             
             List<SeatLockViewDTO> lockedSeats = new ArrayList<>();
-            
-            // 1. Remove duplicates from the request to prevent self-locking
             Set<UUID> uniqueSeatIds = new LinkedHashSet<>(request.getSeatIds());
 
             for (UUID seatId : uniqueSeatIds) {
@@ -82,10 +78,8 @@ public class SeatLockService {
                 
                 while (attempt < 3 && !success) {
                     try {
-                        // Call the internal logic
                         SeatLockViewDTO lock = attemptLockSeat(request.getShowtimeId(), seatId, request.getUserId());
                         lockedSeats.add(lock);
-
                         success = true;
                     } catch (ObjectOptimisticLockingFailureException e) {
                         attempt++;
@@ -93,13 +87,24 @@ public class SeatLockService {
                         handleRetryBackoff(attempt);
                     }
                 }
-            } 
+            }
+            
+            // Publish event instead of calling controller directly
+            if (!lockedSeats.isEmpty()) {
+                SeatUpdateEvent event = new SeatUpdateEvent(
+                    request.getSeatIds(),
+                    request.getShowtimeId(),
+                    SeatStatus.LOCKED,
+                    "LOCKED"
+                );
+                eventPublisher.publishEvent(event);
+            }
+            
             return lockedSeats;
-        }catch (Exception e) {
+        } catch (Exception e) {
             throw new InvalidRequestException("Seat", "Seat could not be locked: "+e.getMessage());
         }
     }
-
     private void handleRetryBackoff(int attempt) {
         try {
             Thread.sleep(100 * attempt);
@@ -220,12 +225,25 @@ public class SeatLockService {
         }catch(Exception e){
             System.out.println(e.getMessage());
         }
-        return seatLockRepository.confirmSeatsBulk(confirmBookingRequestDTO.getSeatIds(),
+        int booked = seatLockRepository.confirmSeatsBulk(
+            confirmBookingRequestDTO.getSeatIds(),
             confirmBookingRequestDTO.getShowtimeId(), 
             confirmBookingRequestDTO.getUserId(),
             Instant.now()
         );
-
+        
+        // Publish event
+        if (booked > 0) {
+            SeatUpdateEvent event = new SeatUpdateEvent(
+                confirmBookingRequestDTO.getSeatIds(),
+                confirmBookingRequestDTO.getShowtimeId(),
+                SeatStatus.BOOKED,
+                "BOOKED"
+            );
+            eventPublisher.publishEvent(event);
+        }
+        
+        return booked;
     }
 
     
@@ -234,21 +252,20 @@ public class SeatLockService {
      */
     @Transactional
     public void releaseSeat(ReleaseSeatsRequestDTO releaseSeatsRequestDTO) {
-        for(UUID seatId:releaseSeatsRequestDTO.getSeatIds()){
-            SeatLock seatLock = seatLockRepository.findByShowtimeIdAndSeatId(releaseSeatsRequestDTO.getShowtimeId(), seatId)
+        for(UUID seatId : releaseSeatsRequestDTO.getSeatIds()){
+            SeatLock seatLock = seatLockRepository.findByShowtimeIdAndSeatId(
+                releaseSeatsRequestDTO.getShowtimeId(), seatId)
                 .orElseThrow(() -> new ResourceNotFoundException("SeatLock", "showtimeId-seatId", 
                 releaseSeatsRequestDTO.getShowtimeId() + "-" + seatId));
             
-            if(seatLock.getStatus()==SeatStatus.BOOKED){
-                throw new InvalidRequestException("SeatId","Seats already booked, cannot be relased");
+            if(seatLock.getStatus() == SeatStatus.BOOKED){
+                throw new InvalidRequestException("SeatId","Seats already booked, cannot be released");
             }
             
-            // Verify user owns this lock
             if (!seatLock.getUser().getId().equals(releaseSeatsRequestDTO.getUserId())) {
-                throw new InvalidRequestException("Seat", "Seats locked by other user, and another user tries to release the lock");
+                throw new InvalidRequestException("Seat", "Seats locked by other user");
             }
 
-            // Only release if LOCKED (not if BOOKED)
             if (seatLock.getStatus() == SeatStatus.LOCKED) {
                 seatLock.setStatus(SeatStatus.AVAILABLE);
                 seatLock.setLockedAt(null);
@@ -256,19 +273,49 @@ public class SeatLockService {
                 seatLockRepository.save(seatLock);
             }   
         }
+        
+        // Publish event
+        SeatUpdateEvent event = new SeatUpdateEvent(
+            releaseSeatsRequestDTO.getSeatIds(),
+            releaseSeatsRequestDTO.getShowtimeId(),
+            SeatStatus.AVAILABLE,
+            "RELEASED"
+        );
+        eventPublisher.publishEvent(event);
     }
-
     /**
      * Scheduled job to release expired locks
      * Runs every minute
      */
-    @Scheduled(fixedRate = 60000) // Every 1 minute
+    @Scheduled(fixedRate = 60000)
     @Transactional
     public void releaseExpiredLocks() {
         Instant now = Instant.now();
+        
+        // Get expired locks before releasing them
+        List<SeatLock> expiredLocks = seatLockRepository.findExpiredLocks(now);
+        
         int releasedCount = seatLockRepository.releaseExpiredLocks(now);
+        
         if (releasedCount > 0) {
             log.info("Released {} expired seat locks", releasedCount);
+            
+            // Group by showtime and publish events
+            Map<UUID, List<UUID>> seatsByShowtime = expiredLocks.stream()
+                .collect(Collectors.groupingBy(
+                    sl -> sl.getShowtime().getId(),
+                    Collectors.mapping(sl -> sl.getSeat().getId(), Collectors.toList())
+                ));
+            
+            for (Map.Entry<UUID, List<UUID>> entry : seatsByShowtime.entrySet()) {
+                SeatUpdateEvent event = new SeatUpdateEvent(
+                    entry.getValue(),
+                    entry.getKey(),
+                    SeatStatus.AVAILABLE,
+                    "EXPIRED"
+                );
+                eventPublisher.publishEvent(event);
+            }
         }
     }
 
@@ -305,5 +352,9 @@ public class SeatLockService {
                 return dto;
             })
             .collect(Collectors.toList());
+    }
+    public String deleteBookedSeats(UUID showtimeId) {
+        int rows = seatLockRepository.deleteByShowtimeId(showtimeId);
+        return rows + "Deleted";
     }
 }

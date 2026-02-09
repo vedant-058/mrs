@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 import com.mrs.mrs.model.SeatLock;
 import com.mrs.mrs.model.SeatLock.SeatStatus;
@@ -75,7 +76,12 @@ public interface SeatLockRepository extends JpaRepository<SeatLock, UUID> {
                             @Param("showtimeId") UUID showtimeId,
                             @Param("userId") UUID userId,
                             @Param("now") Instant now);
-                                   
-                           
-                              
+
+       @Query("SELECT sl FROM SeatLock sl WHERE sl.status = 'LOCKED' AND sl.expiresAt < :now")
+       List<SeatLock> findExpiredLocks(@Param("now") Instant now);
+
+       @Modifying
+       @Transactional
+       @Query("DELETE FROM SeatLock sl WHERE sl.showtime.id = :showtimeId")
+       int deleteByShowtimeId(@Param("showtimeId") UUID showtimeId);     
 }
